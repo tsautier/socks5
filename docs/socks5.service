@@ -1,0 +1,52 @@
+# Example systemd unit for Simple Socks5.
+#
+# Expects a PLAINTEXT config: an encrypted one prompts for the Blowfish key on
+# a terminal and cannot be started unattended.
+#
+#   sudo useradd --system --no-create-home --shell /usr/sbin/nologin socks5
+#   sudo mkdir -p /opt/socks5 && sudo cp bin/socks5 bin/socks5.conf /opt/socks5/
+#   sudo chown -R root:socks5 /opt/socks5 && sudo chmod 640 /opt/socks5/socks5.conf
+#   sudo cp docs/socks5.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now socks5
+
+[Unit]
+Description=Simple Socks5 proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=forking
+WorkingDirectory=/opt/socks5
+PIDFile=/opt/socks5/socks5.pid
+ExecStart=/opt/socks5/socks5 -u /opt/socks5/socks5.conf
+Restart=on-failure
+RestartSec=5
+
+# The daemon binds its listen port and then calls setuid() to the "uid" set in
+# the config file, so it has to start as root. Keep "uid" pointing at an
+# unprivileged account (the socks5 user created above).
+User=root
+
+# Prefer these over the config's built-in chroot, which breaks DNS resolution.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+# socks5 writes its pidfile and (if enabled) its debug log here.
+ReadWritePaths=/opt/socks5
+# Needed for setuid() and for binding a port below 1024.
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+RestrictAddressFamilies=AF_INET AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

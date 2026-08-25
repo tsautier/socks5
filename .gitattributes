@@ -1,0 +1,11 @@
+# The C++ sources are stored with LF and may sit in the working tree as CRLF on
+# Windows; the compiler does not care either way.
+#
+# These, however, must be LF wherever they end up: a shell script with CRLF
+# fails on Linux with "bad interpreter: /bin/bash^M", and GNU make can trip over
+# CRLF after a backslash line-continuation.
+Makefile        text eol=lf
+*.sh            text eol=lf
+*.py            text eol=lf
+Dockerfile      text eol=lf
+*.service       text eol=lf
