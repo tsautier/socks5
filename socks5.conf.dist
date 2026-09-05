@@ -43,3 +43,6 @@ uid=1;
 pidfile=socks5.pid;
 retry_count=10;
 no_ident_check=0;
+use_ssl=0;
+ssl_cert=;
+no_chroot=1;

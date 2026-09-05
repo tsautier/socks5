@@ -4,6 +4,7 @@
 #include "lock.h"
 #include "counter.h"
 #include "userlist.h"
+#include "sslcompat.h"
 
 // some dummy objects to use tools.h
 CConfig config;
@@ -19,133 +20,10 @@ CUserList userlist;
 pthread_attr_t threadattr;
 SSL_CTX *sslctx = NULL;
 
-#define MUTEX_TYPE	pthread_mutex_t
-#define MUTEX_SETUP(x)	pthread_mutex_init(&(x),NULL)
-#define MUTEX_CLEANUP(x)	pthread_mutex_destroy(&(x))
-#define MUTEX_LOCK(x)	pthread_mutex_lock(&(x))
-#define MUTEX_UNLOCK(x)	pthread_mutex_unlock(&(x))
-#define THREAD_ID	pthread_self()
-
-struct CRYPTO_dynlock_value
-{
-	MUTEX_TYPE mutex;
-};
-
-
-static MUTEX_TYPE *mutex_buf = NULL;
-
-static DH *globaldh = NULL;
-
-static void locking_function(int mode, int n, const char * file, int line)
-{
-	stringstream ss;
-	ss << mode << n << file << line;
-	if (mode & CRYPTO_LOCK)
-	{
-		MUTEX_LOCK(mutex_buf[n]);
-	}
-	else
-	{
-		MUTEX_UNLOCK(mutex_buf[n]);
-	}
-}
-
-static unsigned long id_function(void)
-{
-	return ((unsigned long)THREAD_ID);
-}
-
-static struct CRYPTO_dynlock_value * dyn_create_function(const char *file, int line)
-{
-	stringstream ss;
-	ss << file << line;
-	struct CRYPTO_dynlock_value *value;
-	value = (struct CRYPTO_dynlock_value *)malloc(sizeof(struct CRYPTO_dynlock_value));
-	if (!value)
-	{
-		return NULL;
-	}
-	MUTEX_SETUP(value->mutex);
-	return value;
-}
-
-static void dyn_lock_function(int mode, struct CRYPTO_dynlock_value *l, const char *file, int line)
-{
-	stringstream ss;
-	ss << mode << file << line;
-	if (mode & CRYPTO_LOCK)
-	{
-		MUTEX_LOCK(l->mutex);
-	}
-	else
-	{
-		MUTEX_UNLOCK(l->mutex);
-	}
-}
-
-static void dyn_destroy_function(struct CRYPTO_dynlock_value *l, const char *file, int line)
-{
-	stringstream ss;
-	ss << file << line;
-	MUTEX_CLEANUP(l->mutex);
-	free(l);
-}
-
-int THREAD_setup(void)
-{
-	int i;
-	
-	mutex_buf = (MUTEX_TYPE *)malloc(CRYPTO_num_locks() * sizeof(MUTEX_TYPE));
-	if (!mutex_buf)
-	{
-		return 0;
-	}
-	for (i = 0; i < CRYPTO_num_locks(); i++)
-	{
-		MUTEX_SETUP(mutex_buf[i]);
-	}
-	CRYPTO_set_id_callback(id_function);
-	CRYPTO_set_locking_callback(locking_function);
-	
-	CRYPTO_set_dynlock_create_callback(dyn_create_function);
-	CRYPTO_set_dynlock_lock_callback(dyn_lock_function);
-	CRYPTO_set_dynlock_destroy_callback(dyn_destroy_function);
-	
-	return 1;
-}
-
-int THREAD_cleanup(void)
-{
-	int i;
-	
-	if (!mutex_buf)
-	{
-		return 0;
-	}
-	CRYPTO_set_id_callback(NULL);
-	CRYPTO_set_locking_callback(NULL);
-	CRYPTO_set_dynlock_create_callback(NULL);
-	CRYPTO_set_dynlock_lock_callback(NULL);
-	CRYPTO_set_dynlock_destroy_callback(NULL);
-	for (i = 0; i < CRYPTO_num_locks(); i++)
-	{
-		MUTEX_CLEANUP(mutex_buf[i]);
-	}
-	free(mutex_buf);
-	mutex_buf = NULL;
-	return 1;
-}
-
-
-
-DH *tmp_dh_cb(SSL *ssl, int is_export, int keylength)
-{
-	stringstream ss;
-	ss << is_export << keylength << ssl;
-	
-	return globaldh;
-	
-}
+// NOTE: OpenSSL 1.1.0 made libcrypto thread-safe on its own and reduced
+// CRYPTO_set_locking_callback(), CRYPTO_set_id_callback() and the dynlock
+// callbacks to empty macros. The manual pthread mutex plumbing that used to
+// live here was therefore dead code under OpenSSL 3 and has been removed.
 
 int ssl_setup()
 {
@@ -153,7 +31,7 @@ int ssl_setup()
 	
 	if (RAND_status()) { debugmsg("-SYSTEM-","RAND_status ok"); }
 	else { cout << "RAND_status not ok\n"; return 0; }
-	sslctx = SSL_CTX_new(SSLv23_server_method());
+	sslctx = SSL_CTX_new(TLS_server_method());
 	if (sslctx == NULL)
 	{
 		debugmsg("-SYSTEM-", "error creating ctx");		
@@ -161,7 +39,10 @@ int ssl_setup()
 	}
 		
 	SSL_CTX_set_default_verify_paths(sslctx);
-	SSL_CTX_set_options(sslctx,SSL_OP_ALL);
+	SSL_CTX_set_options(sslctx,SSL_OP_ALL | SSL_OP_NO_COMPRESSION |
+	                           SSL_OP_CIPHER_SERVER_PREFERENCE);
+	// TLS 1.0 and 1.1 are long dead; refuse them outright.
+	SSL_CTX_set_min_proto_version(sslctx, TLS1_2_VERSION);
 	SSL_CTX_set_mode(sslctx,SSL_MODE_AUTO_RETRY);
 		
 	debugmsg("-SYSTEM-", "try to load cert file");
@@ -173,7 +54,6 @@ int ssl_setup()
 	}
 	else 
 	{
-		SSL_CTX_use_certificate_chain_file(sslctx,config.ssl_cert.c_str());
 		debugmsg("-SYSTEM-", "try to load private key");
 		if (SSL_CTX_use_PrivateKey_file(sslctx, config.ssl_cert.c_str(), SSL_FILETYPE_PEM) <=0 )
 		{	
@@ -181,23 +61,9 @@ int ssl_setup()
 			return 0;
 		}		
 	}
-	debugmsg("-SYSTEM-", "try to load dh params");
-	FILE *fp = fopen(config.ssl_cert.c_str(), "r");
-	if (fp == NULL) 
-	{ 
-		debugmsg("SYSTEM","[tmp_dh_cb] could not open file!"); 
-		return 0;
-	}
-	globaldh = PEM_read_DHparams(fp, NULL, NULL, NULL);
-	fclose(fp);
-	if(globaldh == NULL)
-	{
-		debugmsg("-SYSTEM-", "read dh params failed");
-		
-		return 0;
-		
-	}
-    
+	debugmsg("-SYSTEM-", "enabling automatic DH parameters");
+	SSL_CTX_set_dh_auto(sslctx, 1);
+
     debugmsg("-SYSTEM-", "try to check private key");
 	if ( !SSL_CTX_check_private_key(sslctx))
 	{		
@@ -206,14 +72,6 @@ int ssl_setup()
 	}
 	
 	SSL_CTX_set_session_cache_mode(sslctx,SSL_SESS_CACHE_OFF);
-	
-	SSL_CTX_set_tmp_dh_callback(sslctx, tmp_dh_cb);
-	
-
-	if(!THREAD_setup())
-	{
-		return 0;
-	}
 	
 	return 1;
 }
@@ -681,7 +539,18 @@ private:
 					{
 						string ip;
 						struct sockaddr_in myaddr;
+						memset(&myaddr,0,sizeof(myaddr));
 						myaddr.sin_family = AF_INET;
+						if(buffer[3] != 1 && buffer[3] != 3)
+						{
+							// RFC 1928: 0x08 = address type not supported.
+							// ATYP 4 (IPv6) lands here.
+							debugmsg("-SYSTEM-","unsupported address type");
+							buffer[0] = 5; // protocol version
+							buffer[1] = 8; // address type not supported
+							DataWrite(tmp_sock,buffer,2,ssl);
+							return;
+						}
 						if(buffer[3] == 1)
 						{
 							memcpy(&myaddr.sin_addr.s_addr,buffer+4,4);
@@ -1004,9 +873,18 @@ void *makethread(void* pData)
 
 int main(int argc,char *argv[])
 {	
-	SSL_load_error_strings();
-	SSL_library_init();
-	OpenSSL_add_all_digests();
+	// Work out whether we will need Blowfish before touching the library.
+	// "socks5 <conf>" is the encrypted form and needs the legacy provider;
+	// "socks5 -u <conf>" is plaintext, and anything else just prints usage.
+	bool need_legacy = (argc == 2);
+
+	string crypto_err;
+	if (!crypto_init(need_legacy, crypto_err))
+	{
+		cout << "Fatal: " << crypto_err << "\n";
+		return -1;
+	}
+
 	pthread_attr_init(&threadattr);
 	pthread_attr_setdetachstate(&threadattr,PTHREAD_CREATE_DETACHED);
 	
@@ -1014,7 +892,7 @@ int main(int argc,char *argv[])
 	{		
 		cout << version << "\n";
 		cout << "Builddate: " << builddate << "\n";
-		cout << "Using " << SSLeay_version(0) << "\n";
+		cout << "Using " << OpenSSL_version(OPENSSL_VERSION) << "\n";
 		cout << "Usage:\n\t socks5 configfile\n";
 		cout << "\t or socks5 -u configfile for uncrypted conf file\n";
 		return -1;
@@ -1031,7 +909,7 @@ int main(int argc,char *argv[])
 		{
 			cout << version << "\n";
 			cout << "Builddate: " << builddate << "\n";
-			cout << "Using " << SSLeay_version(0) << "\n";
+			cout << "Using " << OpenSSL_version(OPENSSL_VERSION) << "\n";
 			cout << "Usage:\n\t socks5 configfile\n";
 			cout << "\t or socks5 -u configfile for uncrypted conf file\n";
 			return -1;
@@ -1109,15 +987,25 @@ int main(int argc,char *argv[])
 	//make gethostbyname working after chroot
 	//struct sockaddr_in tmpaddr = GetIp("www.glftpd.com",21);
 	
-	char *cwd = getcwd(NULL, 4096);	
-	if (chroot(cwd) && !config.no_chroot)
+	char *cwd = getcwd(NULL, 4096);
+	if (config.no_chroot)
 	{
-		debugmsg("-SYSTEM-"," - WARNING: - Could not chroot");		
-	}	
+		// Staying out of the chroot keeps glibc's NSS modules reachable, so
+		// hostname targets still resolve. Set no_chroot=1 in the config if
+		// clients need to connect to anything by name.
+		debugmsg("-SYSTEM-","no_chroot set - not chrooting");
+	}
+	else if (chroot(cwd) != 0)
+	{
+		debugmsg("-SYSTEM-"," - WARNING: - Could not chroot",errno);
+	}
 	else
-	{		
-		chdir("/");
-	}	
+	{
+		if (chdir("/") != 0)
+		{
+			debugmsg("-SYSTEM-"," - WARNING: - Could not chdir after chroot",errno);
+		}
+	}
 	free(cwd);
 			
 	signal(SIGPIPE, SIG_IGN);

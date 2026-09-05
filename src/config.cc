@@ -147,12 +147,31 @@ int CConfig::readconf(string filename,string key,int crypted)
 		
 		if (crypted)
 		{
-			decrypt(key,bufferin,bufferout,s);
+			if (!decrypt(key,bufferin,bufferout,s))
+			{
+				cout << "Decryption failed - see the messages above." << endl
+				     << "(use '-u' if the config file is not encrypted)" << endl;
+				memset(bufferin,0,s+1);
+				memset(bufferout,0,s+1);
+				delete [] bufferin;
+				delete [] bufferout;
+				return 0;
+			}
 			daten = (char*)bufferout;
 			memset(bufferin,'\0',s+1);
 			memset(bufferout,'\0',s+1);
 			delete [] bufferin;
 	 		delete [] bufferout;			
+
+			// Blowfish-CFB is unauthenticated, so decrypting with the wrong
+			// key yields garbage instead of an error. Without this check
+			// every setting silently falls back to its default -- listen_port
+			// 0 and no users -- and the daemon comes up misconfigured.
+			if (daten.find("listen_port") == string::npos)
+			{
+				cout << "Could not decrypt config file - wrong key?" << endl;
+				return 0;
+			}
 		}
 		else
 		{			

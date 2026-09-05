@@ -11,3 +11,10 @@
 *.lai
 *.la
 *.a
+
+# Runtime files
+socks5.pid
+log.txt
+socks5.tar
+socks5.zip
+*.tar.gz

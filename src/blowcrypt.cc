@@ -5,6 +5,7 @@
 #include <string>
 #include <openssl/ssl.h>
 #include "tools.h"
+#include "sslcompat.h"
 #include "config.h"
 #include "lock.h"
 #include "counter.h"
@@ -21,6 +22,13 @@ CUserList userlist;
 
 int main(int argc,char *argv[])
 {
+	string crypto_err;
+	if (!crypto_init(true, crypto_err))
+	{
+		cout << "Fatal: " << crypto_err << "\n";
+		return 1;
+	}
+
 	if (argc < 3 || argc > 4)
 	{
 		cout << "Blowcrypt 1.2 (c) _hawk_/PPX\n";
@@ -63,19 +71,19 @@ int main(int argc,char *argv[])
 			if(!decrypt(k1,in,out,size))
 			{
 				cout << "Decrypt error!\n";
-				delete in;
-				delete out;
+				delete [] in;
+				delete [] out;
 				return 0;
 			}
 			if (!writefile(p3,out,size))
 			{
-				delete in;
-				delete out;
+				delete [] in;
+				delete [] out;
 				cout << "Error opening file!\n";
 				return 0;
 			}
-			delete in;
-			delete out;
+			delete [] in;
+			delete [] out;
 			return 0;
 
 
@@ -108,19 +116,19 @@ int main(int argc,char *argv[])
 			if (!encrypt(k2,in,out,size))
 			{
 				cout << "Encrypt error!\n";
-				delete in;
-				delete out;
+				delete [] in;
+				delete [] out;
 				return 0;
 			}
 			if (!writefile(p3,out,size))
 			{
-				delete in;
-				delete out;
+				delete [] in;
+				delete [] out;
 				cout << "Error opening file!\n";
 				return 0;
 			}
-			delete in;
-			delete out;
+			delete [] in;
+			delete [] out;
 			return 0;
 		}
 		else

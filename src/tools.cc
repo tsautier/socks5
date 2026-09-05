@@ -1,4 +1,5 @@
 #include "tools.h"
+#include "sslcompat.h"
 #include "global.h"
 #include "config.h"
 #include "counter.h"
@@ -1277,7 +1278,7 @@ int control_write(int sock,string s,SSL *sslcon)
 	{
 		blocksize = bytesleft;
 	}
-	int n,len;
+	int n = 0,len;
 	len = s.length();
 	while(total < len)
 	{
@@ -1285,21 +1286,24 @@ int control_write(int sock,string s,SSL *sslcon)
 		tv.tv_usec = 0;
 		FD_ZERO(&writefds);
 		FD_SET(sock,&writefds);
-		if (select(sock+1,NULL,&writefds,NULL,&tv) == -1)
+		int ready = select(sock+1,NULL,&writefds,NULL,&tv);
+		if (ready == -1)
 		{	
 			
 			return 0;
 		}
-		if (FD_ISSET(sock,&writefds))
+		if (ready == 0 || !FD_ISSET(sock,&writefds))
 		{
-			if (!sslcon)
-			{
-				n = send(sock,s.c_str()+total,blocksize,0);
-			}
-			else
-			{
-				n = SSL_write(sslcon, s.c_str()+total, blocksize);
-			}
+			debugmsg("CONTROLWRITE","write timeout",errno);
+			return 0;
+		}
+		if (!sslcon)
+		{
+			n = send(sock,s.c_str()+total,blocksize,0);
+		}
+		else
+		{
+			n = SSL_write(sslcon, s.c_str()+total, blocksize);
 		}
 		if (n < 0)
 		{
@@ -1504,7 +1508,7 @@ int SslConnect(int &sock,SSL **ssl,SSL_CTX **sslctx,int &shouldquit)
 		return 0;
 	}
 	debugmsg("SSLCONNECT", "[SslConnect] start");
-	*sslctx = SSL_CTX_new(SSLv23_client_method());
+	*sslctx = SSL_CTX_new(TLS_client_method());
 	
 	if (*sslctx == NULL)
 	{
@@ -1512,7 +1516,8 @@ int SslConnect(int &sock,SSL **ssl,SSL_CTX **sslctx,int &shouldquit)
 		return 0;
 	}
 	SSL_CTX_set_default_verify_paths(*sslctx);
-	SSL_CTX_set_options(*sslctx,SSL_OP_ALL);
+	SSL_CTX_set_options(*sslctx,SSL_OP_ALL | SSL_OP_NO_COMPRESSION);
+	SSL_CTX_set_min_proto_version(*sslctx, TLS1_2_VERSION);
 	SSL_CTX_set_mode(*sslctx,SSL_MODE_AUTO_RETRY);
 	SSL_CTX_set_session_cache_mode(*sslctx,SSL_SESS_CACHE_OFF);
 	
@@ -2075,47 +2080,71 @@ int writefile(string filename,unsigned char *data,int s)
 	return 1;
 }
 
-int decrypt(string key,unsigned char *datain,unsigned char *dataout,int s)
+// Shared by encrypt() and decrypt(). enc is 1 to encrypt, 0 to decrypt.
+//
+// Every EVP call is checked here. Under OpenSSL 3 the first CipherInit fails
+// unless the legacy provider has been loaded (see crypto_init() in
+// sslcompat.cc), and the original code went on to call
+// EVP_CIPHER_CTX_set_key_length() on the half-initialised context, which
+// segfaults rather than reporting the error.
+static int bf_crypt(string key,unsigned char *datain,unsigned char *dataout,int s,int enc)
 {
 	unsigned char ivec[8];
 	memset(ivec,0, 8);
-	int ipos = 0;
 	int outlen = s;
+	int ok = 0;
 
-	EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
-	EVP_CipherInit_ex(ctx, EVP_bf_cfb(), NULL, NULL, NULL,ipos );
-	EVP_CIPHER_CTX_set_key_length(ctx, key.length());
-	EVP_CipherInit_ex(ctx, NULL, NULL,(unsigned char*)key.c_str(), ivec,ipos );
-
-	if(!EVP_CipherUpdate(ctx, dataout, &outlen, datain, s))
+	// Blowfish takes a 4..56 byte key, so a longer passphrase would be
+	// rejected by EVP_CIPHER_CTX_set_key_length() below.
+	if (key.length() < 4 || key.length() > 56)
 	{
+		debugmsg("-CRYPT-","key must be between 4 and 56 characters");
 		return 0;
 	}
 
+	EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+	if (ctx == NULL)
+	{
+		debugmsg("-CRYPT-","EVP_CIPHER_CTX_new failed");
+		return 0;
+	}
+
+	if (!EVP_CipherInit_ex(ctx, EVP_bf_cfb(), NULL, NULL, NULL, enc))
+	{
+		debugmsg("-CRYPT-","BF-CFB unavailable - is the OpenSSL legacy provider loaded?");
+	}
+	else if (!EVP_CIPHER_CTX_set_key_length(ctx, key.length()))
+	{
+		debugmsg("-CRYPT-","EVP_CIPHER_CTX_set_key_length failed");
+	}
+	else if (!EVP_CipherInit_ex(ctx, NULL, NULL,(unsigned char*)key.c_str(), ivec, enc))
+	{
+		debugmsg("-CRYPT-","EVP_CipherInit_ex failed");
+	}
+	else if (!EVP_CipherUpdate(ctx, dataout, &outlen, datain, s))
+	{
+		debugmsg("-CRYPT-","EVP_CipherUpdate failed");
+	}
+	else
+	{
+		ok = 1;
+	}
+
+	// CFB is a stream mode, so input and output are the same length and
+	// there is no final block to flush.
 	EVP_CIPHER_CTX_free(ctx);
 	for (int i=0;i < (int)key.length();i++) { key[i] = '0'; }
-	return 1;
+	return ok;
+}
+
+int decrypt(string key,unsigned char *datain,unsigned char *dataout,int s)
+{
+	return bf_crypt(key,datain,dataout,s,0);
 }
 
 int encrypt(string key,unsigned char *datain,unsigned char *dataout,int s)
 {
-	unsigned char ivec[8];
-	memset(ivec, 0,8);
-	int outlen = s;
-
-	EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
-	EVP_EncryptInit_ex(ctx, EVP_bf_cfb(), NULL, NULL, NULL );
-	EVP_CIPHER_CTX_set_key_length(ctx, key.length());
-	EVP_EncryptInit_ex(ctx, NULL, NULL, (unsigned char*)key.c_str(), ivec );
-
-	if(!EVP_EncryptUpdate(ctx, dataout, &outlen, datain, s))
-	{
-		return 0;
-	}
-
-	EVP_CIPHER_CTX_free(ctx);
-	for (int i=0;i < (int)key.length();i++) { key[i] = '0'; }
-	return 1;
+	return bf_crypt(key,datain,dataout,s,1);
 }
 
 int GetLine(int sock,SSL **ssl,string &reply)
@@ -2373,7 +2402,7 @@ int filehash(string filename,string algo,string &result)
 string fingerprint(SSL *ssl)
 {
 	X509 *cert;
-	cert = SSL_get_peer_certificate(ssl);
+	cert = SSL_get1_peer_certificate(ssl);
 	if(cert == NULL)
 	{
 		debugmsg("-SYSTEM-", "[datathread] failed to get cert",errno);
